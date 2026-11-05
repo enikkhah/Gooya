@@ -5,8 +5,9 @@
  * ۲) استاندارد Web Speech API در مرورگرها (SpeechRecognition / webkitSpeechRecognition)
  *
  * ویژگی‌ها:
- * - تحمل مکث‌های عادی بین کلمات و جملات (پیش‌فرض: ۵.۵ ثانیه مهلت سکوت پس از صحبت و ۱۲ ثانیه مهلت شروع)
- * - ادامه هوشمند ضبط در صورت قطع زودهنگام مرورگر در میانه صحبت (فقط در صورتی که در قطعه فعلی صحبتی شده باشد تا حلقه قطع و وصل در سکوت رخ ندهد)
+ * - محاسبه زمانی دقیق مهلت شروع (۱۰ ثانیه) و مهلت مکث بین کلمات/جملات (۵.۵ ثانیه پس از هر کلمه)
+ * - ایجاد نمونه تازه (Fresh Instance) با تاخیر ایمن در صورت بسته شدن زودهنگام نشست توسط مرورگر در حین مکث
+ * - پاک‌سازی کامل شنونده‌ها و جلوگیری از قفل شدن plugin.stop() در اندروید برای عملکرد یکسان در دفعات دوم، سوم و بعدی
  * - حذف پیشوندهای تکراری تجمعی کروم اندروید (Cumulative Prefix Deduplication)
  */
 
@@ -19,9 +20,9 @@ export interface VoiceCaptureOptions {
   onListeningChange?: (listening: boolean) => void;
   /** سیگنال برای توقف دستی ضبط توسط کاربر */
   signal?: AbortSignal;
-  /** مهلت سکوت پس از صحبت به میلی‌ثانیه برای لحاظ کردن مکث‌های عادی (پیش‌فرض: ۵۵۰۰ میلی‌ثانیه) */
+  /** مهلت سکوت پس از هر بار صحبت به میلی‌ثانیه برای لحاظ کردن مکث‌های عادی (پیش‌فرض: ۵۵۰۰ میلی‌ثانیه) */
   postSpeechSilenceMs?: number;
-  /** مهلت اولیه شروع صحبت به میلی‌ثانیه (پیش‌فرض: ۱۲۰۰۰ میلی‌ثانیه) */
+  /** مهلت اولیه شروع صحبت به میلی‌ثانیه (پیش‌فرض: ۱۰۰۰۰ میلی‌ثانیه) */
   initialSilenceMs?: number;
 }
 
@@ -177,6 +178,20 @@ function getWebSpeechRecognitionConstructor(): any | null {
 }
 
 /**
+ * توقف ایمن پلاگین بومی بدون قفل شدن Promise (در نسخه ۷ پلاگین اندروید متد stop گاهی resolve نمی‌کند)
+ */
+async function safePluginStop(plugin: CapacitorSpeechPluginLike): Promise<void> {
+  try {
+    await Promise.race([
+      plugin.stop(),
+      new Promise<void>((r) => setTimeout(r, 200)),
+    ]);
+  } catch {
+    // نادیده گرفتن خطا
+  }
+}
+
+/**
  * بررسی پشتیبانی محیط فعلی (اپ اندروید یا مرورگر) از تشخیص گفتار
  */
 export function isVoiceRecognitionSupported(): boolean {
@@ -235,15 +250,32 @@ async function captureWithCapacitorNative(
     }
   }
 
-  const postSpeechSilenceMs = options.postSpeechSilenceMs ?? 5500;
-  const initialSilenceMs = options.initialSilenceMs ?? 12000;
+  // پاک‌سازی کامل هرگونه شنونده یا نشست باقی‌مانده از دفعات قبلی
+  await safePluginStop(plugin);
+  try {
+    await plugin.removeAllListeners();
+  } catch {
+    // نادیده گرفتن
+  }
 
+  const postSpeechSilenceMs = options.postSpeechSilenceMs ?? 5500;
+  const initialSilenceMs = options.initialSilenceMs ?? 10000;
+
+  const sessionStartTime = Date.now();
+  let lastWordTime = 0;
   let committedText = "";
   let currentSegmentText = "";
-  let hadSpeechInCurrentSegment = false;
   let settled = false;
   let userStopped = false;
-  let lastWordTime = 0;
+  let restartingSegment = false;
+
+  const getRemainingGraceMs = (): number => {
+    const now = Date.now();
+    if (lastWordTime > 0) {
+      return postSpeechSilenceMs - (now - lastWordTime);
+    }
+    return initialSilenceMs - (now - sessionStartTime);
+  };
 
   const getCleanText = () => {
     const combined = [committedText, currentSegmentText]
@@ -258,16 +290,23 @@ async function captureWithCapacitorNative(
     let partialHandle: { remove: () => Promise<void> } | null = null;
     let stateHandle: { remove: () => Promise<void> } | null = null;
     let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
     const cleanup = async () => {
       if (silenceTimer) {
         clearTimeout(silenceTimer);
         silenceTimer = null;
       }
+      if (restartTimer) {
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
       options.onListeningChange?.(false);
+      await safePluginStop(plugin);
       try {
         if (partialHandle) await partialHandle.remove();
         if (stateHandle) await stateHandle.remove();
+        await plugin.removeAllListeners();
       } catch {
         // نادیده گرفتن خطای پاکسازی
       }
@@ -289,19 +328,11 @@ async function captureWithCapacitorNative(
       reject(new Error(message));
     };
 
-    const resetTimer = (hasSpokenAnything: boolean) => {
+    const scheduleSilenceCutoff = (waitMs: number) => {
       if (silenceTimer) clearTimeout(silenceTimer);
-      const timeoutMs = hasSpokenAnything
-        ? postSpeechSilenceMs
-        : initialSilenceMs;
-
       silenceTimer = setTimeout(async () => {
+        if (settled) return;
         userStopped = true;
-        try {
-          await plugin.stop();
-        } catch {
-          // نادیده گرفتن
-        }
         const finalStr = getCleanText();
         if (finalStr) {
           await finishWithSuccess(finalStr);
@@ -310,35 +341,81 @@ async function captureWithCapacitorNative(
             "صدایی دریافت نشد. لطفاً دوباره دکمه میکروفون را بزنید و صحبت کنید."
           );
         }
-      }, timeoutMs);
+      }, Math.max(500, waitMs));
     };
 
     const startNativeSegment = async () => {
       if (settled || userStopped) return;
-      hadSpeechInCurrentSegment = false;
+      restartingSegment = false;
 
-      const res = await plugin.start({
-        language: lang,
-        maxResults: 3,
-        partialResults: true,
-        popup: false,
-      });
+      try {
+        const res = await plugin.start({
+          language: lang,
+          maxResults: 3,
+          partialResults: true,
+          popup: false,
+        });
 
-      if (
-        res &&
-        Array.isArray((res as any).matches) &&
-        (res as any).matches[0]
-      ) {
-        const raw = (res as any).matches[0].trim();
-        if (raw) {
-          hadSpeechInCurrentSegment = true;
-          lastWordTime = Date.now();
-          currentSegmentText = mergeCumulativeSpeech(currentSegmentText, raw);
-          const cleaned = getCleanText();
-          options.onInterimResult?.(cleaned);
-          resetTimer(true);
+        if (
+          res &&
+          Array.isArray((res as any).matches) &&
+          (res as any).matches[0]
+        ) {
+          const raw = (res as any).matches[0].trim();
+          if (raw) {
+            lastWordTime = Date.now();
+            currentSegmentText = mergeCumulativeSpeech(currentSegmentText, raw);
+            const cleaned = getCleanText();
+            options.onInterimResult?.(cleaned);
+            scheduleSilenceCutoff(postSpeechSilenceMs);
+          }
+        }
+      } catch (err: any) {
+        if (settled || userStopped) return;
+        const remaining = getRemainingGraceMs();
+        if (remaining > 700) {
+          scheduleNextNativeSegment();
+          return;
+        }
+        const finalStr = getCleanText();
+        if (finalStr) {
+          await finishWithSuccess(finalStr);
+        } else {
+          await finishWithError(
+            translateSpeechError(err?.message || String(err))
+          );
         }
       }
+    };
+
+    const scheduleNextNativeSegment = () => {
+      if (settled || userStopped || restartingSegment) return;
+      const remaining = getRemainingGraceMs();
+      if (remaining <= 700) {
+        const finalStr = getCleanText();
+        if (finalStr) {
+          finishWithSuccess(finalStr);
+        } else {
+          finishWithError(
+            "صدایی تشخیص داده نشد. لطفاً دوباره روی دکمه میکروفون بزنید و صحبت کنید."
+          );
+        }
+        return;
+      }
+
+      restartingSegment = true;
+      if (restartTimer) clearTimeout(restartTimer);
+      restartTimer = setTimeout(() => {
+        if (settled || userStopped) return;
+        if (currentSegmentText.trim()) {
+          committedText = [committedText, currentSegmentText.trim()]
+            .filter(Boolean)
+            .join(" ")
+            .trim();
+          currentSegmentText = "";
+        }
+        startNativeSegment();
+      }, 300);
     };
 
     if (options.signal) {
@@ -350,11 +427,6 @@ async function captureWithCapacitorNative(
         "abort",
         async () => {
           userStopped = true;
-          try {
-            await plugin.stop();
-          } catch {
-            // نادیده گرفتن
-          }
           await finishWithSuccess(getCleanText());
         },
         { once: true }
@@ -365,15 +437,14 @@ async function captureWithCapacitorNative(
       partialHandle = await plugin.addListener(
         "partialResults",
         (data: { matches?: string[] }) => {
-          if (settled) return;
+          if (settled || userStopped) return;
           const raw = data?.matches?.[0]?.trim() || "";
           if (raw) {
-            hadSpeechInCurrentSegment = true;
             lastWordTime = Date.now();
             currentSegmentText = mergeCumulativeSpeech(currentSegmentText, raw);
             const cleaned = getCleanText();
             options.onInterimResult?.(cleaned);
-            resetTimer(true);
+            scheduleSilenceCutoff(postSpeechSilenceMs);
           }
         }
       );
@@ -381,50 +452,17 @@ async function captureWithCapacitorNative(
       stateHandle = await plugin.addListener(
         "listeningState",
         async (data: { status?: "started" | "stopped" }) => {
-          if (settled) return;
+          if (settled || userStopped) return;
           if (data?.status === "started") {
             options.onListeningChange?.(true);
           } else if (data?.status === "stopped") {
-            setTimeout(async () => {
-              if (settled || userStopped) return;
-
-              // اگر کاربر در همین قطعه صحبت کرده و مکث کوتاهی داشته (کمتر از مهلت سکوت)،
-              // قطعه قبلی را ذخیره کن و فقط در همین حالت اجازه ادامه صحبت بده
-              const elapsedSinceWord = Date.now() - lastWordTime;
-              if (
-                hadSpeechInCurrentSegment &&
-                elapsedSinceWord < postSpeechSilenceMs - 500
-              ) {
-                if (currentSegmentText.trim()) {
-                  committedText = [committedText, currentSegmentText.trim()]
-                    .filter(Boolean)
-                    .join(" ")
-                    .trim();
-                  currentSegmentText = "";
-                }
-                try {
-                  await startNativeSegment();
-                  return;
-                } catch {
-                  // اگر ادامه ممکن نبود، متن دریافت‌شده را نهایی کن
-                }
-              }
-
-              const finalStr = getCleanText();
-              if (finalStr) {
-                await finishWithSuccess(finalStr);
-              } else {
-                await finishWithError(
-                  "صدایی تشخیص داده نشد. لطفاً دوباره روی دکمه میکروفون بزنید و صحبت کنید."
-                );
-              }
-            }, 450);
+            scheduleNextNativeSegment();
           }
         }
       );
 
       options.onListeningChange?.(true);
-      resetTimer(false);
+      scheduleSilenceCutoff(initialSilenceMs);
       await startNativeSegment();
     } catch {
       try {
@@ -461,25 +499,29 @@ function captureWithWebSpeech(
   options: VoiceCaptureOptions
 ): Promise<string> {
   const postSpeechSilenceMs = options.postSpeechSilenceMs ?? 5500;
-  const initialSilenceMs = options.initialSilenceMs ?? 12000;
+  const initialSilenceMs = options.initialSilenceMs ?? 10000;
 
   return new Promise<string>((resolve, reject) => {
-    const recognition = new WebRecognition();
-    recognition.lang = lang;
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-
-    let committedText = "";
-    let currentSessionTranscript = "";
-    let hadSpeechInCurrentSession = false;
+    const sessionStartTime = Date.now();
     let lastSpeechTime = 0;
+    let committedText = "";
+    let currentSegmentText = "";
+    let activeRecognition: any = null;
     let settled = false;
     let userStopped = false;
     let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let restartTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const getRemainingGraceMs = (): number => {
+      const now = Date.now();
+      if (lastSpeechTime > 0) {
+        return postSpeechSilenceMs - (now - lastSpeechTime);
+      }
+      return initialSilenceMs - (now - sessionStartTime);
+    };
 
     const getCleanTranscript = () => {
-      const combined = [committedText, currentSessionTranscript]
+      const combined = [committedText, currentSegmentText]
         .map((s) => s.trim())
         .filter(Boolean)
         .join(" ")
@@ -487,24 +529,37 @@ function captureWithWebSpeech(
       return collapseRepeatedPrefixes(combined);
     };
 
-    const clearTimer = () => {
+    const clearTimers = () => {
       if (silenceTimer) {
         clearTimeout(silenceTimer);
         silenceTimer = null;
       }
+      if (restartTimer) {
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
+    };
+
+    const stopActiveRecognizer = () => {
+      if (!activeRecognition) return;
+      try {
+        activeRecognition.onresult = null;
+        activeRecognition.onerror = null;
+        activeRecognition.onend = null;
+        activeRecognition.onstart = null;
+        activeRecognition.stop();
+      } catch {
+        // نادیده گرفتن
+      }
+      activeRecognition = null;
     };
 
     const finishSuccess = (text: string) => {
       if (settled) return;
       settled = true;
       userStopped = true;
-      clearTimer();
-      try {
-        recognition.onend = null;
-        recognition.stop();
-      } catch {
-        // نادیده گرفتن
-      }
+      clearTimers();
+      stopActiveRecognizer();
       options.onListeningChange?.(false);
       resolve(collapseRepeatedPrefixes(text));
     };
@@ -513,22 +568,16 @@ function captureWithWebSpeech(
       if (settled) return;
       settled = true;
       userStopped = true;
-      clearTimer();
-      try {
-        recognition.onend = null;
-        recognition.stop();
-      } catch {
-        // نادیده گرفتن
-      }
+      clearTimers();
+      stopActiveRecognizer();
       options.onListeningChange?.(false);
       reject(new Error(msg));
     };
 
-    const resetSilenceTimer = (hasSpoken: boolean) => {
+    const scheduleSilenceCutoff = (waitMs: number) => {
       if (silenceTimer) clearTimeout(silenceTimer);
-      const waitMs = hasSpoken ? postSpeechSilenceMs : initialSilenceMs;
-
       silenceTimer = setTimeout(() => {
+        if (settled) return;
         userStopped = true;
         const finalStr = getCleanTranscript();
         if (finalStr) {
@@ -538,7 +587,116 @@ function captureWithWebSpeech(
             "صدایی دریافت نشد. لطفاً میکروفون را فعال کرده و دستور خود را بیان کنید."
           );
         }
-      }, waitMs);
+      }, Math.max(500, waitMs));
+    };
+
+    const startFreshWebSegment = () => {
+      if (settled || userStopped) return;
+
+      stopActiveRecognizer();
+
+      const recognition = new WebRecognition();
+      activeRecognition = recognition;
+      recognition.lang = lang;
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
+
+      recognition.onstart = () => {
+        if (!settled && !userStopped) {
+          options.onListeningChange?.(true);
+        }
+      };
+
+      recognition.onresult = (event: any) => {
+        if (settled || userStopped) return;
+
+        let merged = "";
+        for (let i = 0; i < event.results.length; i++) {
+          const result = event.results[i];
+          const chunk = (result[0]?.transcript || "").trim();
+          if (chunk) {
+            merged = mergeCumulativeSpeech(merged, chunk);
+          }
+        }
+
+        if (merged) {
+          lastSpeechTime = Date.now();
+          currentSegmentText = merged;
+          const cleaned = getCleanTranscript();
+          options.onInterimResult?.(cleaned);
+          // هر بار که کلمه‌ای دریافت می‌شود، مهلت مکث ۵.۵ ثانیه‌ای از نو تنظیم می‌شود
+          scheduleSilenceCutoff(postSpeechSilenceMs);
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        if (settled || userStopped) return;
+        const code = String(event?.error || "").toLowerCase();
+
+        // خطاهای قطعی مثل عدم مجوز میکروفون بلافاصله متوقف شوند
+        if (
+          code.includes("not-allowed") ||
+          code.includes("service-not-allowed") ||
+          code.includes("audio-capture")
+        ) {
+          finishError(translateSpeechError(code));
+          return;
+        }
+
+        // برای no-speech یا aborted اجازه می‌دهیم onend تصمیم بگیرد که آیا هنوز مهلت مکث باقی مانده یا خیر
+      };
+
+      recognition.onend = () => {
+        if (settled) return;
+
+        if (userStopped) {
+          finishSuccess(getCleanTranscript());
+          return;
+        }
+
+        // ذخیره کلمات دریافت‌شده در این قطعه پیش از بررسی مهلت مکث
+        if (currentSegmentText.trim()) {
+          committedText = [committedText, currentSegmentText.trim()]
+            .filter(Boolean)
+            .join(" ")
+            .trim();
+          currentSegmentText = "";
+        }
+
+        // اگر هنوز از مهلت اولیه (۱۰ ثانیه) یا مهلت مکث پس از آخرین کلمه (۵.۵ ثانیه) زمان باقی مانده است،
+        // یک نمونه تازه با تاخیر کوتاه بساز تا مکث‌های دوم، سوم و بعدی هم کاملاً پوشش داده شوند
+        const remaining = getRemainingGraceMs();
+        if (remaining > 650) {
+          if (restartTimer) clearTimeout(restartTimer);
+          restartTimer = setTimeout(() => {
+            if (!settled && !userStopped) {
+              startFreshWebSegment();
+            }
+          }, 180);
+          return;
+        }
+
+        const finalStr = getCleanTranscript();
+        if (finalStr) {
+          finishSuccess(finalStr);
+        } else {
+          finishError(
+            "صدایی تشخیص داده نشد. لطفاً دوباره روی دکمه میکروفون بزنید و صحبت کنید."
+          );
+        }
+      };
+
+      try {
+        recognition.start();
+      } catch (err: any) {
+        const existing = getCleanTranscript();
+        if (existing) {
+          finishSuccess(existing);
+        } else {
+          finishError(translateSpeechError(err?.message || String(err)));
+        }
+      }
     };
 
     if (options.signal) {
@@ -556,107 +714,9 @@ function captureWithWebSpeech(
       );
     }
 
-    recognition.onstart = () => {
-      if (!settled) {
-        hadSpeechInCurrentSession = false;
-        options.onListeningChange?.(true);
-      }
-    };
-
-    recognition.onresult = (event: any) => {
-      if (settled) return;
-
-      let merged = "";
-      for (let i = 0; i < event.results.length; i++) {
-        const result = event.results[i];
-        const chunk = (result[0]?.transcript || "").trim();
-        if (chunk) {
-          merged = mergeCumulativeSpeech(merged, chunk);
-        }
-      }
-
-      if (merged) {
-        hadSpeechInCurrentSession = true;
-        lastSpeechTime = Date.now();
-        currentSessionTranscript = merged;
-        const cleaned = getCleanTranscript();
-        options.onInterimResult?.(cleaned);
-        resetSilenceTimer(true);
-      }
-    };
-
-    recognition.onerror = (event: any) => {
-      if (settled) return;
-      const code = String(event?.error || "").toLowerCase();
-
-      if (code === "no-speech" || code === "aborted") {
-        const existing = getCleanTranscript();
-        if (existing) {
-          finishSuccess(existing);
-        } else if (userStopped || code === "aborted") {
-          finishSuccess("");
-        }
-        return;
-      }
-
-      const existing = getCleanTranscript();
-      if (existing) {
-        finishSuccess(existing);
-        return;
-      }
-
-      finishError(translateSpeechError(code));
-    };
-
-    recognition.onend = () => {
-      if (settled) return;
-
-      if (userStopped) {
-        finishSuccess(getCleanTranscript());
-        return;
-      }
-
-      // اگر مرورگر در میانه مکث کوتاه کاربر (در حالی که در همین نشست صحبت کرده بود) ارتباط را بست،
-      // متن قبلی را حفظ کن و اجازه بده کاربر ادامه جمله‌اش را بگوید.
-      // اما اگر در نشست فعلی هیچ صحبتی نشده بود، دیگر ری‌استارت نکن تا حلقه قطع و وصل رخ ندهد!
-      const elapsedSinceLastSpeech = Date.now() - lastSpeechTime;
-      if (
-        hadSpeechInCurrentSession &&
-        elapsedSinceLastSpeech < postSpeechSilenceMs - 500
-      ) {
-        if (currentSessionTranscript.trim()) {
-          committedText = [committedText, currentSessionTranscript.trim()]
-            .filter(Boolean)
-            .join(" ")
-            .trim();
-          currentSessionTranscript = "";
-        }
-        hadSpeechInCurrentSession = false;
-        try {
-          recognition.start();
-          return;
-        } catch {
-          // اگر شروع مجدد ممکن نبود، همان متن دریافت‌شده را برگردان
-        }
-      }
-
-      const finalStr = getCleanTranscript();
-      if (finalStr) {
-        finishSuccess(finalStr);
-      } else {
-        finishError(
-          "صدایی تشخیص داده نشد. لطفاً دوباره روی دکمه میکروفون بزنید و صحبت کنید."
-        );
-      }
-    };
-
-    try {
-      options.onListeningChange?.(true);
-      resetSilenceTimer(false);
-      recognition.start();
-    } catch (err: any) {
-      finishError(translateSpeechError(err?.message || String(err)));
-    }
+    options.onListeningChange?.(true);
+    scheduleSilenceCutoff(initialSilenceMs);
+    startFreshWebSegment();
   });
 }
 
