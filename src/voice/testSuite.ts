@@ -1326,13 +1326,185 @@ export const VOICE_TEST_CASES: VoiceTestCase[] = [
     id: 90,
     category: "الگوهای مرزی (تاریخ نسبی نسبت به مناسبت دیگر)",
     input: "دو روز قبل از یلدا ساعت ۵ عصر بهم بگو خرید آجیل",
-    note: "محاسبه تاریخ نسبت به یک مناسبت نام‌گذاری‌شده («دو روز قبل از یلدا») پشتیبانی نمی‌شود",
     getExpected: (now) => ({
       intent: "create_reminder",
       entities: {
         title: "خرید آجیل",
         ...explicitJalali(now, 9, 28),
         time: "17:00",
+      },
+    }),
+  },
+
+  // ==================== ۱۵. الگوهای گسترده مکان، مناسبت و ایده (۹۱ تا ۱۰۵) ====================
+  {
+    id: 91,
+    category: "ذخیره مکان",
+    input: "لوکیشن اینجا رو ذخیره کن پارکینگ طبقاتی بازار",
+    getExpected: () => ({
+      intent: "save_place",
+      entities: {
+        title: "پارکینگ طبقاتی بازار",
+      },
+    }),
+  },
+  {
+    id: 92,
+    category: "ذخیره مکان",
+    input: "جایی که الان هستم رو ثبت کن به اسم مطب دکتر رضایی",
+    getExpected: () => ({
+      intent: "save_place",
+      entities: {
+        title: "مطب دکتر رضایی",
+      },
+    }),
+  },
+  {
+    id: 93,
+    category: "ذخیره مکان",
+    input: "این آدرس رو ذخیره کن داروخانه شبانه‌روزی ولیعصر",
+    getExpected: () => ({
+      intent: "save_place",
+      entities: {
+        title: "داروخانه شبانهروزی ولیعصر",
+      },
+    }),
+  },
+  {
+    id: 94,
+    category: "ذخیره مکان",
+    input: "کافه گلشن رو به عنوان مکان ذخیره کن",
+    getExpected: () => ({
+      intent: "save_place",
+      entities: {
+        title: "کافه گلشن",
+      },
+    }),
+  },
+  {
+    id: 95,
+    category: "ذخیره مکان",
+    input: "ثبت موقعیت مکانی تعمیرگاه مرکزی",
+    getExpected: () => ({
+      intent: "save_place",
+      entities: {
+        title: "تعمیرگاه مرکزی",
+      },
+    }),
+  },
+  {
+    id: 96,
+    category: "ثبت مناسبت",
+    input: "زادروز فردوسی ۲۵ اردیبهشت رو ثبت کن",
+    getExpected: (now) => ({
+      intent: "create_occasion",
+      entities: {
+        title: "زادروز فردوسی",
+        ...explicitJalali(now, 2, 25),
+      },
+    }),
+  },
+  {
+    id: 97,
+    category: "ثبت مناسبت",
+    input: "ماهگرد آشناییمون ۱۰ آذر یادم بنداز",
+    getExpected: (now) => ({
+      intent: "create_occasion",
+      entities: {
+        title: "ماهگرد آشناییمون",
+        ...explicitJalali(now, 9, 10),
+      },
+    }),
+  },
+  {
+    id: 98,
+    category: "ثبت مناسبت",
+    input: "جشن فارغ‌التحصیلی سارا ۱۸ تیر رو به عنوان مناسبت ثبت کن",
+    getExpected: (now) => ({
+      intent: "create_occasion",
+      entities: {
+        title: "جشن فارغالتحصیلی سارا",
+        ...explicitJalali(now, 4, 18),
+      },
+    }),
+  },
+  {
+    id: 99,
+    category: "ثبت مناسبت",
+    input: "روز معلم ۱۲ اردیبهشت هر سال یادآوری کن",
+    getExpected: (now) => ({
+      intent: "create_occasion",
+      entities: {
+        title: "روز معلم",
+        ...explicitJalali(now, 2, 12),
+        recurrence: "yearly",
+      },
+    }),
+  },
+  {
+    id: 100,
+    category: "ثبت مناسبت",
+    input: "سالمرگ پدربزرگ ۳ دی رو ثبت کن",
+    getExpected: (now) => ({
+      intent: "create_occasion",
+      entities: {
+        title: "سالمرگ پدربزرگ",
+        ...explicitJalali(now, 10, 3),
+      },
+    }),
+  },
+  {
+    id: 101,
+    category: "ثبت ایده و یادداشت",
+    input: "یه ایده به ذهنم رسید طراحی سیستم امتیازدهی کاربران",
+    getExpected: () => ({
+      intent: "capture_idea",
+      entities: {
+        title: "طراحی سیستم امتیازدهی کاربران",
+      },
+    }),
+  },
+  {
+    id: 102,
+    category: "ثبت ایده و یادداشت",
+    input: "این نکته رو یادداشت کن بررسی کتابخانه جدید نمودار",
+    getExpected: () => ({
+      intent: "capture_idea",
+      entities: {
+        title: "بررسی کتابخانه جدید نمودار",
+      },
+    }),
+  },
+  {
+    id: 103,
+    category: "ثبت ایده و یادداشت",
+    input: "برام بنویس که کلید زاپاس داخل کشوی اول است",
+    getExpected: () => ({
+      intent: "capture_idea",
+      entities: {
+        title: "کلید زاپاس داخل کشوی اول است",
+      },
+    }),
+  },
+  {
+    id: 104,
+    category: "ثبت ایده و یادداشت",
+    input: "نوت بردار خلاصه کتاب عادت‌های اتمی",
+    getExpected: () => ({
+      intent: "capture_idea",
+      entities: {
+        title: "خلاصه کتاب عادتهای اتمی",
+      },
+    }),
+  },
+  {
+    id: 105,
+    category: "ثبت ایده و یادداشت",
+    input: "تو یادداشت‌هام بنویس شماره پیگیری مرسوله پستی",
+    getExpected: () => ({
+      intent: "capture_idea",
+      entities: {
+        title: "شماره پیگیری مرسوله پستی",
       },
     }),
   },

@@ -1,6 +1,6 @@
 {
   "name": "آزمایشگاه فهم دستور فارسی (یاد)",
   "description": "ماژول مستقل و آفلاین پردازش زبان طبیعی فارسی برای تشخیص نیت، تاریخ شمسی، ساعت و تکرار در دستورات صوتی و متنی",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

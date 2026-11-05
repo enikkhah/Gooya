@@ -45,6 +45,24 @@ jobs:
       - name: Sync Capacitor Android
         run: npx cap sync android
 
+      - name: Configure Android SpeechRecognizer silence timeout for natural pauses
+        run: |
+          PLUGIN_JAVA="node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java"
+          if [ -f "$PLUGIN_JAVA" ]; then
+            node -e '
+              const fs = require("fs");
+              const file = process.argv[1];
+              let src = fs.readFileSync(file, "utf8");
+              if (!src.includes("EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS")) {
+                src = src.replace(
+                  "intent.putExtra(\"android.speech.extra.DICTATION_MODE\", partialResults);",
+                  "intent.putExtra(\"android.speech.extra.DICTATION_MODE\", partialResults);\n        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 5000L);\n        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 4000L);\n        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 8000L);"
+                );
+                fs.writeFileSync(file, src, "utf8");
+              }
+            ' "$PLUGIN_JAVA"
+          fi
+
       - name: Build Debug APK with Gradle
         run: |
           cd android

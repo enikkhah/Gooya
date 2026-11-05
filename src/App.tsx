@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   parseCommand,
   ParsedCommand,
@@ -7,6 +7,10 @@ import {
   gregorianToJalali,
   formatJalaliISO,
 } from "./voice/voiceIntent";
+import {
+  getTranscript,
+  isVoiceRecognitionSupported,
+} from "./voice/getTranscript";
 import {
   runAllVoiceTests,
   TestRunResult,
@@ -34,6 +38,9 @@ import {
   FlaskConical,
   Home,
   ListChecks,
+  Mic,
+  Square,
+  AlertCircle,
 } from "lucide-react";
 
 const STORAGE_THEME_KEY = "gooya_theme_v1";
@@ -44,6 +51,7 @@ interface HistoryEntry {
   input: string;
   timestamp: string;
   result: ParsedCommand;
+  fromVoice?: boolean;
 }
 
 const PERSIAN_WEEKDAYS = [
@@ -254,7 +262,15 @@ export default function App() {
       const raw = localStorage.getItem(STORAGE_HISTORY_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed)) {
+          return parsed.filter(
+            (item) =>
+              item &&
+              typeof item.input === "string" &&
+              item.result &&
+              item.result.entities
+          );
+        }
       }
     } catch {
       // نادیده گرفتن خطا
@@ -271,7 +287,11 @@ export default function App() {
     }
   };
 
-  const handleAnalyzeMain = (customText?: string, addToHistory = true) => {
+  const handleAnalyzeMain = (
+    customText?: string,
+    addToHistory = true,
+    fromVoice = false
+  ) => {
     const targetText = (customText !== undefined ? customText : inputText).trim();
     const res = parseCommand(targetText, referenceDate);
     setParsedResult(res);
@@ -282,6 +302,7 @@ export default function App() {
         input: targetText,
         timestamp: `${referenceJalaliInfo.readable} · ${referenceJalaliInfo.time}`,
         result: res,
+        fromVoice,
       };
       const filteredPrev = history.filter((h) => h.input !== targetText);
       const updated = [entry, ...filteredPrev].slice(0, 12);
@@ -291,6 +312,85 @@ export default function App() {
 
   const handleClearHistory = () => {
     saveHistoryToStorage([]);
+  };
+
+  // ۴.۵. مدیریت دریافت صوتی (میکروفون)
+  const [isListening, setIsListening] = useState<boolean>(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const voiceAbortRef = useRef<AbortController | null>(null);
+  const voiceSupported = useMemo(() => isVoiceRecognitionSupported(), []);
+
+  const handleToggleVoiceMain = async () => {
+    setVoiceError(null);
+
+    if (isListening) {
+      voiceAbortRef.current?.abort();
+      return;
+    }
+
+    const controller = new AbortController();
+    voiceAbortRef.current = controller;
+
+    try {
+      setIsListening(true);
+      const finalSpeech = await getTranscript({
+        lang: "fa-IR",
+        signal: controller.signal,
+        onListeningChange: (listening) => {
+          setIsListening(listening);
+        },
+        onInterimResult: (liveText) => {
+          setInputText(liveText);
+          setParsedResult(parseCommand(liveText, referenceDate));
+        },
+      });
+
+      const cleaned = finalSpeech.trim();
+      if (cleaned) {
+        setInputText(cleaned);
+        handleAnalyzeMain(cleaned, true, true);
+      }
+    } catch (err: any) {
+      setVoiceError(
+        err?.message || "خطا در دریافت صدای میکروفون. لطفاً دوباره تلاش کنید."
+      );
+    } finally {
+      setIsListening(false);
+      voiceAbortRef.current = null;
+    }
+  };
+
+  const handleVoiceAddBatch = async () => {
+    setVoiceError(null);
+    if (isListening) {
+      voiceAbortRef.current?.abort();
+      return;
+    }
+
+    const controller = new AbortController();
+    voiceAbortRef.current = controller;
+
+    try {
+      setIsListening(true);
+      const finalSpeech = await getTranscript({
+        lang: "fa-IR",
+        signal: controller.signal,
+        onListeningChange: (listening) => setIsListening(listening),
+      });
+      const cleaned = finalSpeech.trim();
+      if (cleaned) {
+        setCustomBatchText((prev) =>
+          prev.trim() ? `${prev.trim()}\n${cleaned}` : cleaned
+        );
+      }
+    } catch (err: any) {
+      setVoiceError(
+        err?.message || "خطا در دریافت صدای میکروفون. لطفاً دوباره تلاش کنید."
+      );
+    } finally {
+      setIsListening(false);
+      voiceAbortRef.current = null;
+    }
   };
 
   // ۵. وضعیت صفحه دوم (تست‌های من و ۹۰ تست استاندارد)
@@ -461,15 +561,79 @@ export default function App() {
           /* ==================== صفحه اول: دستیار اصلی گویا ==================== */
           <div className="space-y-6">
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-              {/* بخش ورودی دستور */}
+              {/* بخش ورودی دستور (متنی و صوتی) */}
               <section className="lg:col-span-6 bg-white dark:bg-slate-900 border border-stone-200/80 dark:border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
-                <div className="space-y-2">
-                  <label
-                    htmlFor="gooya-input"
-                    className="block text-sm font-semibold text-slate-800 dark:text-slate-200"
-                  >
-                    دستور خود را بنویسید:
-                  </label>
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <label
+                      htmlFor="gooya-input"
+                      className="block text-sm font-semibold text-slate-800 dark:text-slate-200"
+                    >
+                      دستور خود را بگویید یا بنویسید:
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={handleToggleVoiceMain}
+                      className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer shrink-0 ${
+                        isListening
+                          ? "bg-rose-600 hover:bg-rose-700 text-white animate-pulse"
+                          : "bg-teal-50 dark:bg-teal-950/70 hover:bg-teal-100 dark:hover:bg-teal-900/80 text-teal-800 dark:text-teal-300 border border-teal-200/80 dark:border-teal-800"
+                      }`}
+                    >
+                      {isListening ? (
+                        <>
+                          <Square className="w-3.5 h-3.5 fill-current shrink-0" />
+                          <span>توقف ضبط</span>
+                        </>
+                      ) : (
+                        <>
+                          <Mic className="w-3.5 h-3.5 shrink-0" />
+                          <span>میکروفون فارسی</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  {/* نوار وضعیت فعال بودن میکروفون */}
+                  {isListening && (
+                    <div className="flex items-center justify-between gap-3 bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800/80 rounded-xl px-3.5 py-2.5 text-xs text-rose-800 dark:text-rose-200">
+                      <div className="flex items-center gap-2.5">
+                        <span className="relative flex h-3 w-3 shrink-0">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-3 w-3 bg-rose-600"></span>
+                        </span>
+                        <span className="font-semibold">
+                          در حال شنیدن صدای شما... دستور فارسی خود را بگویید
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleToggleVoiceMain}
+                        className="px-2.5 py-1 rounded-lg bg-rose-600 text-white font-medium hover:bg-rose-700 transition-colors shrink-0 cursor-pointer"
+                      >
+                        ثبت و پایان
+                      </button>
+                    </div>
+                  )}
+
+                  {/* نمایش خطای میکروفون در صورت بروز */}
+                  {voiceError && (
+                    <div className="flex items-start justify-between gap-2 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/80 rounded-xl p-3 text-xs text-amber-900 dark:text-amber-200">
+                      <div className="flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                        <span>{voiceError}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setVoiceError(null)}
+                        className="text-amber-700 dark:text-amber-300 hover:underline shrink-0 font-medium cursor-pointer"
+                      >
+                        بستن
+                      </button>
+                    </div>
+                  )}
+
                   <textarea
                     id="gooya-input"
                     rows={3}
@@ -481,14 +645,46 @@ export default function App() {
                       );
                     }}
                     placeholder="مثال: فردا ساعت ۵ عصر یادآوری کن دکتر برم..."
-                    className="w-full rounded-xl border border-stone-300 dark:border-slate-700 bg-stone-50/70 dark:bg-slate-950 p-3.5 text-sm sm:text-base text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:bg-white dark:focus:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-600 dark:focus:ring-teal-500 transition-colors leading-relaxed"
+                    className={`w-full rounded-xl border p-3.5 text-sm sm:text-base text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:ring-2 transition-colors leading-relaxed ${
+                      isListening
+                        ? "border-rose-400 dark:border-rose-500 bg-rose-50/20 dark:bg-rose-950/20 focus:ring-rose-500"
+                        : "border-stone-300 dark:border-slate-700 bg-stone-50/70 dark:bg-slate-950 focus:bg-white dark:focus:bg-slate-900 focus:ring-teal-600 dark:focus:ring-teal-500"
+                    }`}
                   />
                 </div>
 
-                <div className="flex items-center gap-2.5">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  {/* دکمه اصلی دریافت صوتی با میکروفون */}
                   <button
                     type="button"
-                    onClick={() => handleAnalyzeMain(inputText, true)}
+                    onClick={handleToggleVoiceMain}
+                    title={
+                      voiceSupported
+                        ? "دریافت دستور صوتی با میکروفون"
+                        : "تلاش برای فعال‌سازی میکروفون"
+                    }
+                    className={`flex-1 sm:flex-initial min-h-[46px] px-5 py-2.5 text-sm font-semibold rounded-xl transition-all flex items-center justify-center gap-2 whitespace-nowrap shrink-0 cursor-pointer ${
+                      isListening
+                        ? "bg-rose-600 hover:bg-rose-700 text-white shadow-sm"
+                        : "bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:hover:bg-white text-white dark:text-slate-900"
+                    }`}
+                  >
+                    {isListening ? (
+                      <>
+                        <Square className="w-4 h-4 fill-current shrink-0" />
+                        <span>توقف و تحلیل صدا</span>
+                      </>
+                    ) : (
+                      <>
+                        <Mic className="w-4 h-4 shrink-0" />
+                        <span>گفتن دستور (صوتی)</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleAnalyzeMain(inputText, true, false)}
                     className="flex-1 sm:flex-initial min-h-[46px] px-6 py-2.5 bg-teal-700 hover:bg-teal-800 dark:bg-teal-600 dark:hover:bg-teal-500 text-white text-sm font-semibold rounded-xl transition-colors flex items-center justify-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Sparkles className="w-4 h-4 shrink-0" />
@@ -500,6 +696,7 @@ export default function App() {
                     onClick={() => {
                       setInputText("");
                       setParsedResult(parseCommand("", referenceDate));
+                      setVoiceError(null);
                     }}
                     className="min-h-[46px] px-4 py-2.5 bg-stone-100 dark:bg-slate-800 hover:bg-stone-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs sm:text-sm font-medium rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
@@ -722,8 +919,11 @@ export default function App() {
                         className="w-full py-3 px-2 hover:bg-stone-50 dark:hover:bg-slate-800/50 rounded-xl transition-colors text-right flex flex-col sm:flex-row sm:items-center justify-between gap-2 cursor-pointer"
                       >
                         <div className="space-y-0.5">
-                          <div className="text-sm font-semibold text-slate-900 dark:text-white">
-                            {item.input}
+                          <div className="text-sm font-semibold text-slate-900 dark:text-white flex items-center gap-1.5">
+                            {item.fromVoice && (
+                              <Mic className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 shrink-0" />
+                            )}
+                            <span>{item.input}</span>
                           </div>
                           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
                             <span className={`font-medium ${meta.accentClass}`}>
@@ -823,7 +1023,28 @@ export default function App() {
                   </p>
                 </div>
 
-                <div className="flex items-center gap-2 self-start sm:self-auto">
+                <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+                  <button
+                    type="button"
+                    onClick={handleVoiceAddBatch}
+                    className={`min-h-[40px] px-3 py-1.5 text-xs font-semibold rounded-xl transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                      isListening
+                        ? "bg-rose-600 text-white animate-pulse"
+                        : "bg-teal-50 dark:bg-teal-950/70 hover:bg-teal-100 text-teal-800 dark:text-teal-300 border border-teal-200/80 dark:border-teal-800"
+                    }`}
+                  >
+                    {isListening ? (
+                      <>
+                        <Square className="w-3.5 h-3.5 fill-current" />
+                        <span>توقف ضبط</span>
+                      </>
+                    ) : (
+                      <>
+                        <Mic className="w-3.5 h-3.5" />
+                        <span>افزودن جمله با صدا</span>
+                      </>
+                    )}
+                  </button>
                   <button
                     type="button"
                     onClick={() => setCustomBatchText(DEFAULT_CUSTOM_LINES)}
